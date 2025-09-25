@@ -1,0 +1,225 @@
+# train_custom_metrics.py
+"""
+Full runnable example:
+- Synthetic binary classification data (imbalanced)
+- Keras model (simple dense)
+- Custom F1 and MCC metrics (tf.keras.metrics.Metric)
+- Weighted BCE loss using logits (tf.nn.weighted_cross_entropy_with_logits)
+- Threshold tuning on validation to pick best F1
+"""
+
+import numpy as np
+import tensorflow as tf
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# ------------------------
+# 1) Data: synthetic binary classification (imbalanced)
+# ------------------------
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+X, y = make_classification(
+    n_samples=5000,
+    n_features=20,
+    n_informative=6,
+    n_redundant=2,
+    n_clusters_per_class=2,
+    weights=[0.85, 0.15],  # class imbalance: 15% positive
+    flip_y=0.01,
+    class_sep=1.0,
+    random_state=RANDOM_SEED
+)
+y = y.astype(np.float32)
+
+# scale features
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# split
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=RANDOM_SEED, stratify=y)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=RANDOM_SEED, stratify=y_temp)
+
+print("Shapes:", X_train.shape, X_val.shape, X_test.shape)
+print("Class ratios (train):", np.mean(y_train), " (val):", np.mean(y_val), " (test):", np.mean(y_test))
+
+# ------------------------
+# 2) Custom metrics for Keras: F1 and MCC
+# ------------------------
+EPS = 1e-7
+
+class F1Score(tf.keras.metrics.Metric):
+    def __init__(self, name='f1_score', threshold=0.5, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.threshold = threshold
+        self.tp = self.add_weight(name='tp', initializer='zeros', dtype=tf.float32)
+        self.fp = self.add_weight(name='fp', initializer='zeros', dtype=tf.float32)
+        self.fn = self.add_weight(name='fn', initializer='zeros', dtype=tf.float32)
+
+    def update_state(self, y_true, y_pred_logits, sample_weight=None):
+        # y_pred_logits are raw logits; convert to probabilities
+        y_prob = tf.math.sigmoid(y_pred_logits)
+        y_pred = tf.cast(y_prob >= self.threshold, tf.float32)
+        y_true = tf.cast(y_true, tf.float32)
+        tp = tf.reduce_sum(y_pred * y_true)
+        fp = tf.reduce_sum(y_pred * (1. - y_true))
+        fn = tf.reduce_sum((1. - y_pred) * y_true)
+        self.tp.assign_add(tp)
+        self.fp.assign_add(fp)
+        self.fn.assign_add(fn)
+
+    def result(self):
+        precision = self.tp / (self.tp + self.fp + EPS)
+        recall = self.tp / (self.tp + self.fn + EPS)
+        f1 = 2 * precision * recall / (precision + recall + EPS)
+        return f1
+
+    def reset_states(self):
+        self.tp.assign(0.)
+        self.fp.assign(0.)
+        self.fn.assign(0.)
+
+class MCCMetric(tf.keras.metrics.Metric):
+    def __init__(self, name='mcc', threshold=0.5, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.threshold = threshold
+        # accumulate counts across batches
+        self.tp = self.add_weight(name='tp', initializer='zeros', dtype=tf.float32)
+        self.tn = self.add_weight(name='tn', initializer='zeros', dtype=tf.float32)
+        self.fp = self.add_weight(name='fp', initializer='zeros', dtype=tf.float32)
+        self.fn = self.add_weight(name='fn', initializer='zeros', dtype=tf.float32)
+
+    def update_state(self, y_true, y_pred_logits, sample_weight=None):
+        y_prob = tf.math.sigmoid(y_pred_logits)
+        y_pred = tf.cast(y_prob >= self.threshold, tf.float32)
+        y_true = tf.cast(y_true, tf.float32)
+        tp = tf.reduce_sum(y_pred * y_true)
+        tn = tf.reduce_sum((1. - y_pred) * (1. - y_true))
+        fp = tf.reduce_sum(y_pred * (1. - y_true))
+        fn = tf.reduce_sum((1. - y_pred) * y_true)
+        self.tp.assign_add(tp)
+        self.tn.assign_add(tn)
+        self.fp.assign_add(fp)
+        self.fn.assign_add(fn)
+
+    def result(self):
+        # Matthews correlation coefficient formula
+        num = (self.tp * self.tn) - (self.fp * self.fn)
+        den = tf.sqrt((self.tp + self.fp) * (self.tp + self.fn) * (self.tn + self.fp) * (self.tn + self.fn) + EPS)
+        return num / (den + EPS)
+
+    def reset_states(self):
+        self.tp.assign(0.)
+        self.tn.assign(0.)
+        self.fp.assign(0.)
+        self.fn.assign(0.)
+
+# ------------------------
+# 3) Weighted BCE loss (works with logits)
+# ------------------------
+def weighted_bce_with_logits(pos_weight):
+    """
+    pos_weight > 1 increases penalty for missing positives.
+    This uses tf.nn.weighted_cross_entropy_with_logits which expects logits.
+    """
+    def loss(y_true, logits):
+        y_true = tf.cast(y_true, logits.dtype)
+        # returns per-example loss
+        per_example_loss = tf.nn.weighted_cross_entropy_with_logits(labels=y_true, logits=logits, pos_weight=pos_weight)
+        return tf.reduce_mean(per_example_loss)
+    return loss
+
+# Determine pos_weight from training class frequency (common heuristic)
+# pos_weight = (neg_count / pos_count)
+pos_count = np.sum(y_train == 1)
+neg_count = np.sum(y_train == 0)
+pos_weight_est = float(neg_count / (pos_count + 1e-12))
+print("Estimated pos_weight (neg/pos):", pos_weight_est)
+
+# ------------------------
+# 4) Model: simple MLP that outputs logits (no final sigmoid)
+# ------------------------
+def build_model(input_dim, hidden_units=[64, 32], dropout=0.2):
+    inputs = tf.keras.Input(shape=(input_dim,))
+    x = inputs
+    for u in hidden_units:
+        x = tf.keras.layers.Dense(u, activation='relu')(x)
+        x = tf.keras.layers.Dropout(dropout)(x)
+    # output logits (no activation)
+    logits = tf.keras.layers.Dense(1, activation=None)(x)
+    model = tf.keras.Model(inputs=inputs, outputs=logits)
+    return model
+
+model = build_model(X_train.shape[1])
+model.summary()
+
+# compile
+pos_weight_to_use = pos_weight_est  # you can set manually like 3.0 if needed
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+    loss=weighted_bce_with_logits(pos_weight=pos_weight_to_use),
+    metrics=[F1Score(name='f1_at_0.5', threshold=0.5), MCCMetric(name='mcc_at_0.5', threshold=0.5)]
+)
+
+# ------------------------
+# 5) Train
+# ------------------------
+BATCH_SIZE = 64
+EPOCHS = 8
+
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    batch_size=BATCH_SIZE,
+    epochs=EPOCHS,
+    verbose=2
+)
+
+# ------------------------
+# 6) Evaluate & threshold tuning on validation set
+# ------------------------
+# Get logits on validation and test
+val_logits = model.predict(X_val, batch_size=128)
+val_probs = tf.math.sigmoid(val_logits).numpy().ravel()
+test_logits = model.predict(X_test, batch_size=128)
+test_probs = tf.math.sigmoid(test_logits).numpy().ravel()
+
+# function to compute f1 for many thresholds
+from sklearn.metrics import f1_score as sk_f1, precision_score, recall_score, confusion_matrix
+
+def find_best_threshold(y_true, y_probs, num_thresholds=101):
+    best_thresh = 0.5
+    best_f1 = -1.0
+    thresholds = np.linspace(0.01, 0.99, num_thresholds)
+    for t in thresholds:
+        preds = (y_probs >= t).astype(int)
+        f1 = sk_f1(y_true, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = t
+    return best_thresh, best_f1
+
+best_thresh, best_f1 = find_best_threshold(y_val, val_probs, num_thresholds=99)
+print(f"Best threshold on validation for F1: {best_thresh:.3f}, F1={best_f1:.4f}")
+
+# Evaluate on test with default 0.5 and best threshold
+def evaluate_at_threshold(y_true, y_probs, threshold):
+    preds = (y_probs >= threshold).astype(int)
+    f1 = sk_f1(y_true, preds, zero_division=0)
+    prec = precision_score(y_true, preds, zero_division=0)
+    rec = recall_score(y_true, preds, zero_division=0)
+    tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
+    return {'threshold': threshold, 'f1': f1, 'precision': prec, 'recall': rec, 'TP': int(tp), 'TN': int(tn), 'FP': int(fp), 'FN': int(fn)}
+
+res_default = evaluate_at_threshold(y_test, test_probs, 0.5)
+res_best = evaluate_at_threshold(y_test, test_probs, best_thresh)
+print("Test performance at threshold 0.5:", res_default)
+print("Test performance at best validation-tuned threshold:", res_best)
+
+# ------------------------
+# 7) Save model if you want
+# ------------------------
+model.save("model_with_custom_metrics_and_weighted_bce_logits", save_format="tf")
+print("Model saved to ./model_with_custom_metrics_and_weighted_bce_logits")
